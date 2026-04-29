@@ -7,10 +7,13 @@
 # Usage: perl test_all.pl [options] [directory]
 #
 # Options:
-#   -t, --timeout N   Per-puzzle timeout in seconds (default: 60)
-#   -j, --jobs N      Unused (reserved for future parallel support)
-#   -v, --verbose     Show each puzzle's output
-#   -h, --help        Show this help
+#   -t, --timeout N     Per-puzzle timeout in seconds (default: 60)
+#   --hints             Generate LLM hints via ollama before solving
+#   --model MODEL       Ollama model for hints (default: qwen2.5:7b)
+#   --candidates N      Candidates per clue (default: 3)
+#   --pdf-dir DIR       Directory with source PDFs (for hint generation)
+#   -v, --verbose       Show each puzzle's output
+#   -h, --help          Show this help
 
 use strict;
 use warnings;
@@ -19,14 +22,22 @@ use Time::HiRes qw(time);
 use File::Basename;
 use File::Spec;
 
-my $timeout = 60;
-my $verbose = 0;
-my $help    = 0;
+my $timeout    = 60;
+my $verbose    = 0;
+my $help       = 0;
+my $use_hints  = 0;
+my $model      = 'qwen2.5:7b';
+my $candidates = 3;
+my $pdf_dir    = '';
 
 GetOptions(
-    'timeout|t=i' => \$timeout,
-    'verbose|v'   => \$verbose,
-    'help|h'      => \$help,
+    'timeout|t=i'    => \$timeout,
+    'verbose|v'      => \$verbose,
+    'help|h'         => \$help,
+    'hints'          => \$use_hints,
+    'model=s'        => \$model,
+    'candidates|n=i' => \$candidates,
+    'pdf-dir=s'      => \$pdf_dir,
 ) or usage();
 usage() if $help;
 
@@ -36,6 +47,16 @@ die "Directory '$dir' not found\n" unless -d $dir;
 my $solver = File::Spec->catfile(dirname(__FILE__), 'solve.pl');
 die "Solver not found at '$solver'\n" unless -f $solver;
 
+my $get_hints = File::Spec->catfile(dirname(__FILE__), 'get_hints.py');
+if ($use_hints && !-f $get_hints) {
+    die "get_hints.py not found at '$get_hints' (required for --hints)\n";
+}
+
+# Determine PDF directory for hint generation
+if ($use_hints && !$pdf_dir) {
+    $pdf_dir = $dir;  # assume PDFs are in same directory as .txt files
+}
+
 # Find all .txt grid files (skip _solved.txt files)
 opendir my $dh, $dir or die "Cannot open $dir: $!\n";
 my @puzzles = sort grep { /\.txt$/ && !/_(solved|solution)\.txt$/ } readdir $dh;
@@ -43,7 +64,9 @@ closedir $dh;
 
 die "No .txt puzzle files found in $dir\n" unless @puzzles;
 
-printf "Solving %d puzzles in %s (timeout: %ds)\n\n", scalar @puzzles, $dir, $timeout;
+printf "Solving %d puzzles in %s (timeout: %ds%s)\n\n",
+    scalar @puzzles, $dir, $timeout,
+    $use_hints ? ", with LLM hints via $model" : "";
 
 my $solved   = 0;
 my $failed   = 0;
@@ -64,6 +87,35 @@ for my $i (0 .. $#puzzles) {
 
     my $t0 = time();
 
+    # Generate hints if requested
+    my $hints_file = '';
+    if ($use_hints) {
+        my $pdf_base = $base;
+        my $pdf_path = File::Spec->catfile($pdf_dir, "${pdf_base}.pdf");
+
+        if (-f $pdf_path) {
+            $hints_file = File::Spec->catfile($dir, "${base}.hints");
+
+            # Only regenerate if hints file doesn't exist
+            unless (-f $hints_file) {
+                my @cmd = ('python3', $get_hints, $pdf_path,
+                           '-o', $hints_file,
+                           '-m', $model,
+                           '-n', $candidates,
+                           '--grid', $path);
+                my $hint_out = `@cmd 2>&1`;
+                my $hint_rc = $? >> 8;
+                if ($hint_rc != 0) {
+                    print "HINT_ERR " if $verbose;
+                    $hints_file = '';  # proceed without hints
+                }
+            }
+        } else {
+            # No PDF found, solve without hints
+            printf "(no PDF) " if $verbose;
+        }
+    }
+
     # Run solver with timeout using fork/exec for clean process control
     my $output = '';
     my $timed_out_flag = 0;
@@ -78,7 +130,9 @@ for my $i (0 .. $#puzzles) {
 
     if ($pid == 0) {
         # Child: exec the solver
-        exec('perl', $solver, $path) or exit(127);
+        my @cmd = ('perl', $solver, $path);
+        push @cmd, "--hints=$hints_file" if $hints_file && -f $hints_file;
+        exec(@cmd) or exit(127);
     }
 
     # Parent: read with timeout
@@ -165,11 +219,18 @@ sub usage {
 Usage: perl test_all.pl [options] [directory]
 
 Options:
-  -t, --timeout N   Per-puzzle timeout in seconds (default: 60)
-  -v, --verbose     Show solver output for each puzzle
-  -h, --help        Show this help
+  -t, --timeout N     Per-puzzle timeout in seconds (default: 60)
+  --hints             Generate LLM hints via ollama before solving
+  --model MODEL       Ollama model for hints (default: qwen2.5:7b)
+  --candidates N      Candidates per clue (default: 3)
+  --pdf-dir DIR       Directory with source PDFs (default: same as puzzle dir)
+  -v, --verbose       Show solver output for each puzzle
+  -h, --help          Show this help
 
 Default directory: WSJ Crosswords/ (relative to this script)
+
+Example:
+  perl test_all.pl --hints --timeout=90 "WSJ Crosswords/"
 END
     exit 1;
 }
